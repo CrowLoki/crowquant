@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "crowquant"
+version = "0.1.0"
+description = "Adaptive vector compression for AI memory systems"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Crow (Darren Croll)"}]
+dependencies = ["numpy>=1.24.0"]
+
+[project.optional-dependencies]
+cuda = ["torch>=2.0"]
+lance = ["lancedb>=0.1"]
+sqlite = ["sqlite-vec>=0.1.6"]
+all = ["torch>=2.0", "lancedb>=0.1", "sqlite-vec>=0.1.6"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+crowquant = "crowquant.cli:main"
