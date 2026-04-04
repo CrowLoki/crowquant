@@ -1,95 +1,111 @@
-"""Compression profiles for different hardware targets."""
+"""Hardware profiles for CrowQuant.
+
+Defines preset configurations optimised for different hardware targets.
+Auto-detection selects the best profile based on available resources.
+"""
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
 @dataclass
-class CompressionProfile:
-    """A named compression configuration."""
+class HardwareProfile:
+    """Configuration profile for a specific hardware target.
+
+    Attributes
+    ----------
+    name : str
+        Human-readable profile name.
+    default_bits : int
+        Default quantization bit-width.
+    use_cuda : bool
+        Whether to use CUDA-accelerated operations.
+    batch_size : int
+        Recommended batch size for bulk operations.
+    wht_method : str
+        WHT implementation to use ("numpy" or "cuda").
+    description : str
+        Human-readable description of the target hardware.
+
+    Examples
+    --------
+    >>> p = HardwareProfile("Test", 4, False, 64, "numpy", "Test profile")
+    >>> p.name
+    'Test'
+    """
+
     name: str
-    n_bits: int
-    use_wht: bool
-    adaptive_outliers: bool
-    outlier_threshold: float
+    default_bits: int
+    use_cuda: bool
+    batch_size: int
+    wht_method: str
     description: str
 
-    @property
-    def theoretical_ratio(self) -> float:
-        """Theoretical compression ratio vs float32."""
-        # float32 = 32 bits per dim
-        # compressed = n_bits per dim (ignoring small overhead)
-        return 32.0 / self.n_bits
 
-
-# CrowStation profile: aggressive compression for Crow's local hardware
-# (40GB RAM, RTX 3050 Ti 4GB VRAM, 2.5TB NVMe)
-CrowStation = CompressionProfile(
+CrowStation = HardwareProfile(
     name="CrowStation",
-    n_bits=3,
-    use_wht=True,
-    adaptive_outliers=True,
-    outlier_threshold=2.5,
-    description=(
-        "Aggressive 3-bit compression with WHT and outlier preservation. "
-        "Optimized for Crow's local machine -- fits ~10x more vectors in "
-        "the same memory footprint with <5% recall loss."
-    ),
+    default_bits=3,
+    use_cuda=True,
+    batch_size=512,
+    wht_method="cuda",
+    description="Crow's ASUS TUF Dash F15 (RTX 3050 Ti, 40GB RAM)",
 )
 
-# Universal profile: safe default that works everywhere
-Universal = CompressionProfile(
+Universal = HardwareProfile(
     name="Universal",
-    n_bits=4,
-    use_wht=True,
-    adaptive_outliers=True,
-    outlier_threshold=3.0,
-    description=(
-        "Balanced 4-bit compression with WHT. Works well on any hardware. "
-        "8x compression with <2% recall loss on typical embeddings."
-    ),
+    default_bits=4,
+    use_cuda=False,
+    batch_size=128,
+    wht_method="numpy",
+    description="Any machine, pure Python + NumPy",
 )
 
-# Additional profiles
-Aggressive = CompressionProfile(
-    name="Aggressive",
-    n_bits=2,
-    use_wht=True,
-    adaptive_outliers=True,
-    outlier_threshold=2.0,
-    description=(
-        "Maximum 2-bit compression for extremely memory-constrained "
-        "environments. 16x compression with ~10-15% recall loss."
-    ),
-)
 
-HighFidelity = CompressionProfile(
-    name="HighFidelity",
-    n_bits=8,
-    use_wht=True,
-    adaptive_outliers=False,
-    outlier_threshold=3.0,
-    description=(
-        "Conservative 8-bit compression. 4x compression with negligible "
-        "recall loss. Good for critical vectors where accuracy matters."
-    ),
-)
+def get_profile(name: str | None = None) -> HardwareProfile:
+    """Auto-detect or select a hardware profile.
 
-_PROFILES = {
-    "crowstation": CrowStation,
-    "universal": Universal,
-    "aggressive": Aggressive,
-    "highfidelity": HighFidelity,
-}
+    Parameters
+    ----------
+    name : str or None
+        Profile name to select.  Recognised values: "crowstation",
+        "universal".  If None, auto-detects based on CUDA availability.
 
+    Returns
+    -------
+    HardwareProfile
+        The selected or auto-detected profile.
 
-def get_profile(name: str) -> CompressionProfile:
-    """Get a compression profile by name (case-insensitive)."""
-    key = name.lower()
-    if key not in _PROFILES:
-        available = ", ".join(_PROFILES.keys())
-        raise ValueError(f"unknown profile '{name}', available: {available}")
-    return _PROFILES[key]
+    Raises
+    ------
+    ValueError
+        If name is not a recognised profile.
 
+    Examples
+    --------
+    >>> get_profile("universal").name
+    'Universal'
+    >>> get_profile("crowstation").use_cuda
+    True
+    >>> get_profile().name in ("CrowStation", "Universal")
+    True
+    """
+    if name is not None:
+        key = name.lower().strip()
+        if key == "crowstation":
+            return CrowStation
+        if key == "universal":
+            return Universal
+        raise ValueError(
+            f"Unknown profile '{name}'. Choose 'crowstation' or 'universal'."
+        )
 
-def list_profiles() -> list[CompressionProfile]:
-    """Return all available profiles."""
-    return list(_PROFILES.values())
+    # Auto-detect
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return CrowStation
+    except ImportError:
+        pass
+
+    return Universal

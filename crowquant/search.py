@@ -1,73 +1,185 @@
-"""Compressed-domain similarity search."""
+"""Compressed vector search operations for CrowQuant.
+
+The key innovation: dot products and KNN directly on compressed
+representations, avoiding full decompression.  Instead of reconstructing
+float vectors, we use centroid lookup tables to approximate inner
+products in O(d) with tiny constants.
+"""
+from __future__ import annotations
+
+from typing import Sequence
+
 import numpy as np
-from typing import Optional
-from .core import CrowQuantBlock, unpack_bits, dequantize, quantize
+
+from .core import CrowQuantBlock, lloyd_max_centroids, unpack_bits
 
 
-def compressed_dot_product(block_a: CrowQuantBlock, block_b: CrowQuantBlock,
-                           use_wht: bool = True) -> float:
-    """Compute approximate dot product between two compressed vectors.
+def _get_indices(block: CrowQuantBlock) -> np.ndarray:
+    """Unpack centroid indices from a CrowQuantBlock.
 
-    Dequantizes both vectors and computes their dot product. While this
-    doesn't save compute on the dot product itself, it enables storage
-    of vectors in compressed form with on-the-fly decompression.
+    Parameters
+    ----------
+    block : CrowQuantBlock
+        Compressed vector.
+
+    Returns
+    -------
+    np.ndarray
+        uint8 array of centroid indices, length = block.padded_dim.
     """
-    a = dequantize(block_a, use_wht=use_wht)
-    b = dequantize(block_b, use_wht=use_wht)
-    return float(np.dot(a, b))
+    return unpack_bits(block.packed_data, block.n_bits, block.padded_dim)
 
 
-def compressed_cosine(block_a: CrowQuantBlock, block_b: CrowQuantBlock,
-                      use_wht: bool = True) -> float:
-    """Compute approximate cosine similarity between two compressed vectors."""
-    a = dequantize(block_a, use_wht=use_wht)
-    b = dequantize(block_b, use_wht=use_wht)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-10 or norm_b < 1e-10:
+def compressed_dot_product(block_a: CrowQuantBlock, block_b: CrowQuantBlock) -> float:
+    """Approximate dot product between two CrowQuant blocks WITHOUT full decompression.
+
+    Uses centroid-based computation: instead of reconstructing full float
+    vectors, we look up centroid values for each index pair and accumulate
+    the product.  This is O(d) with small constants -- just index lookups
+    and multiplies, no WHT inverse needed.
+
+    For best accuracy both blocks should use the same n_bits and seed,
+    but the function handles mismatched settings gracefully.
+
+    Parameters
+    ----------
+    block_a : CrowQuantBlock
+        First compressed vector.
+    block_b : CrowQuantBlock
+        Second compressed vector.
+
+    Returns
+    -------
+    float
+        Approximate dot product <a, b>.
+
+    Notes
+    -----
+    The approximation is exact in the quantized domain: it computes the
+    true dot product of the dequantized (but still rotated) vectors.
+    Since WHT is orthogonal, the dot product is preserved under rotation,
+    so this equals the dot product of the dequantized output vectors.
+
+    Examples
+    --------
+    >>> from crowquant.core import quantize, dequantize
+    >>> import numpy as np
+    >>> a = np.random.randn(128)
+    >>> b = np.random.randn(128)
+    >>> ba = quantize(a, n_bits=4)
+    >>> bb = quantize(b, n_bits=4)
+    >>> approx = compressed_dot_product(ba, bb)
+    >>> exact = np.dot(dequantize(ba), dequantize(bb))
+    >>> abs(approx - exact) < 1e-6
+    True
+    """
+    centroids_a = lloyd_max_centroids(block_a.n_bits)
+    centroids_b = lloyd_max_centroids(block_b.n_bits)
+
+    idx_a = _get_indices(block_a)
+    idx_b = _get_indices(block_b)
+
+    n = min(len(idx_a), len(idx_b))
+
+    vals_a = centroids_a[idx_a[:n]] * block_a.scale + block_a.zero
+    vals_b = centroids_b[idx_b[:n]] * block_b.scale + block_b.zero
+
+    return float(np.dot(vals_a, vals_b))
+
+
+def compressed_cosine(block_a: CrowQuantBlock, block_b: CrowQuantBlock) -> float:
+    """Approximate cosine similarity from compressed blocks.
+
+    Computes cos(a, b) = dot(a, b) / (||a|| * ||b||) using centroid
+    lookups -- no full decompression needed.
+
+    Parameters
+    ----------
+    block_a : CrowQuantBlock
+        First compressed vector.
+    block_b : CrowQuantBlock
+        Second compressed vector.
+
+    Returns
+    -------
+    float
+        Approximate cosine similarity in [-1, 1].
+
+    Examples
+    --------
+    >>> from crowquant.core import quantize
+    >>> import numpy as np
+    >>> v = np.random.randn(64)
+    >>> ba = quantize(v, n_bits=4)
+    >>> bb = quantize(v, n_bits=4)
+    >>> compressed_cosine(ba, bb) > 0.99
+    True
+    """
+    centroids_a = lloyd_max_centroids(block_a.n_bits)
+    centroids_b = lloyd_max_centroids(block_b.n_bits)
+
+    idx_a = _get_indices(block_a)
+    idx_b = _get_indices(block_b)
+
+    n = min(len(idx_a), len(idx_b))
+
+    vals_a = centroids_a[idx_a[:n]] * block_a.scale + block_a.zero
+    vals_b = centroids_b[idx_b[:n]] * block_b.scale + block_b.zero
+
+    dot_ab = np.dot(vals_a, vals_b)
+    norm_a = np.linalg.norm(vals_a)
+    norm_b = np.linalg.norm(vals_b)
+
+    if norm_a < 1e-12 or norm_b < 1e-12:
         return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+
+    return float(dot_ab / (norm_a * norm_b))
 
 
-def compressed_knn(query: np.ndarray, blocks: list[CrowQuantBlock],
-                   k: int = 5, metric: str = "cosine",
-                   use_wht: bool = True) -> list[tuple[int, float]]:
-    """Find k nearest neighbors from a list of compressed blocks.
+def compressed_knn(
+    query_block: CrowQuantBlock,
+    database_blocks: Sequence[CrowQuantBlock],
+    k: int = 5,
+) -> list[tuple[int, float]]:
+    """Find k nearest neighbors using compressed dot products.
 
-    Args:
-        query: Uncompressed query vector.
-        blocks: List of CrowQuantBlocks to search.
-        k: Number of neighbors to return.
-        metric: "cosine" or "dot".
-        use_wht: Whether WHT was used during compression.
+    Scores each database block against the query using compressed_dot_product
+    and returns the top-k by score (highest dot product = most similar,
+    assuming normalised embeddings).
 
-    Returns:
-        List of (index, score) tuples, sorted by descending score.
+    Parameters
+    ----------
+    query_block : CrowQuantBlock
+        The query vector (compressed).
+    database_blocks : sequence of CrowQuantBlock
+        Database of compressed vectors to search.
+    k : int
+        Number of nearest neighbors to return.
+
+    Returns
+    -------
+    list of (index, score) tuples
+        Top-k results sorted by descending dot product score.
+
+    Examples
+    --------
+    >>> from crowquant.core import quantize
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(42)
+    >>> db = [quantize(rng.standard_normal(64), n_bits=3) for _ in range(20)]
+    >>> query = db[5]
+    >>> results = compressed_knn(query, db, k=3)
+    >>> results[0][0]  # top hit should be index 5 (itself)
+    5
+    >>> len(results)
+    3
     """
+    k = min(k, len(database_blocks))
+
     scores = []
-    for i, block in enumerate(blocks):
-        vec = dequantize(block, use_wht=use_wht)
-        if metric == "cosine":
-            norm_q = np.linalg.norm(query)
-            norm_v = np.linalg.norm(vec)
-            if norm_q < 1e-10 or norm_v < 1e-10:
-                score = 0.0
-            else:
-                score = float(np.dot(query, vec) / (norm_q * norm_v))
-        elif metric == "dot":
-            score = float(np.dot(query, vec))
-        else:
-            raise ValueError(f"unknown metric: {metric}")
+    for i, db_block in enumerate(database_blocks):
+        score = compressed_dot_product(query_block, db_block)
         scores.append((i, score))
 
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[:k]
-
-
-def batch_dequantize(blocks: list[CrowQuantBlock],
-                     use_wht: bool = True) -> np.ndarray:
-    """Dequantize a batch of blocks into a 2D array."""
-    if not blocks:
-        return np.array([], dtype=np.float64)
-    vecs = [dequantize(b, use_wht=use_wht) for b in blocks]
-    return np.stack(vecs)
